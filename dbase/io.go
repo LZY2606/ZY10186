@@ -89,8 +89,39 @@ func OpenTable(config *Config) (*File, error) {
 }
 
 // Close closes all file handlers for the dBase file and its associated memo file.
+// Close holds the write lock, so it waits for in-flight reads to finish. After
+// Close every entry point returns ErrClosed; repeated Close calls are no-ops.
 func (file *File) Close() error {
-	return file.defaults().io.Close(file)
+	file.mu.Lock()
+	defer file.mu.Unlock()
+	if file.closed {
+		return nil
+	}
+	if err := file.io.Close(file); err != nil {
+		return err
+	}
+	file.closed = true
+	return nil
+}
+
+// beginRead takes the read lock for a read entry point.
+func (file *File) beginRead() error {
+	file.mu.RLock()
+	if file.closed {
+		file.mu.RUnlock()
+		return NewError("table is closed").Details(ErrClosed)
+	}
+	return nil
+}
+
+// beginWrite takes the write lock for a mutating entry point.
+func (file *File) beginWrite() error {
+	file.mu.Lock()
+	if file.closed {
+		file.mu.Unlock()
+		return NewError("table is closed").Details(ErrClosed)
+	}
+	return nil
 }
 
 // Create creates a new dBase database file (and the memo file if needed).
@@ -105,6 +136,7 @@ func (file *File) ReadHeader() error {
 }
 
 // WriteHeader writes the header to the dBase file.
+// Callers are responsible for holding the write lock.
 func (file *File) WriteHeader() error {
 	return file.defaults().io.WriteHeader(file)
 }
@@ -127,23 +159,46 @@ func (file *File) ReadMemoHeader() error {
 
 // WriteMemoHeader writes the memo header to the memo file.
 // The size parameter specifies the number of blocks the new memo data will occupy.
+// Callers are responsible for holding memoMutex and the write lock.
 func (file *File) WriteMemoHeader(size int) error {
 	return file.defaults().io.WriteMemoHeader(file, size)
 }
 
 // ReadRow reads the raw row data of one row at the specified row position.
 func (file *File) ReadRow(position uint32) ([]byte, error) {
+	if err := file.beginRead(); err != nil {
+		return nil, err
+	}
+	defer file.mu.RUnlock()
+	return file.defaults().io.ReadRow(file, position)
+}
+
+// readRowLocked performs ReadRow without locking; callers must hold RLock or Lock.
+func (file *File) readRowLocked(position uint32) ([]byte, error) {
 	return file.defaults().io.ReadRow(file, position)
 }
 
 // WriteRow writes the raw row data to the specified row position in the dBase file.
 func (file *File) WriteRow(row *Row) error {
+	if err := file.beginWrite(); err != nil {
+		return err
+	}
+	defer file.mu.Unlock()
 	return file.defaults().io.WriteRow(file, row)
 }
 
 // ReadMemo reads one or more blocks from the memo file for the specified memo column.
 // Returns the raw data and a boolean indicating if the data is text (true) or binary (false).
 func (file *File) ReadMemo(address []byte, column *Column) ([]byte, bool, error) {
+	if err := file.beginRead(); err != nil {
+		return nil, false, err
+	}
+	defer file.mu.RUnlock()
+	return file.defaults().io.ReadMemo(file, address, column)
+}
+
+// readMemoLocked performs ReadMemo without locking; callers must hold RLock or Lock.
+func (file *File) readMemoLocked(address []byte, column *Column) ([]byte, bool, error) {
 	return file.defaults().io.ReadMemo(file, address, column)
 }
 
@@ -151,6 +206,16 @@ func (file *File) ReadMemo(address []byte, column *Column) ([]byte, bool, error)
 // The text parameter indicates whether the data is text (true) or binary (false).
 // The length parameter specifies the length of the data to write.
 func (file *File) WriteMemo(address []byte, data []byte, text bool, length int) ([]byte, error) {
+	if err := file.beginWrite(); err != nil {
+		return nil, err
+	}
+	defer file.mu.Unlock()
+	return file.defaults().io.WriteMemo(address, file, data, text, length)
+}
+
+// writeMemoLocked performs WriteMemo without taking the file write lock; callers
+// must already hold Lock. memoMutex is still taken inside the IO implementation.
+func (file *File) writeMemoLocked(address []byte, data []byte, text bool, length int) ([]byte, error) {
 	return file.defaults().io.WriteMemo(address, file, data, text, length)
 }
 
@@ -158,18 +223,40 @@ func (file *File) WriteMemo(address []byte, data []byte, text bool, length int) 
 // The null flag field indicates if the field has a variable length.
 // Returns true as the first value if the field is variable length, and true as the second value if the field is null.
 func (file *File) ReadNullFlag(position uint64, column *Column) (bool, bool, error) {
+	if err := file.beginRead(); err != nil {
+		return false, false, err
+	}
+	defer file.mu.RUnlock()
+	return file.defaults().io.ReadNullFlag(file, position, column)
+}
+
+// readNullFlagLocked performs ReadNullFlag without locking; callers must hold RLock or Lock.
+func (file *File) readNullFlagLocked(position uint64, column *Column) (bool, bool, error) {
 	return file.defaults().io.ReadNullFlag(file, position, column)
 }
 
 // Search searches for rows that contain the specified value in the given field.
 // If exactMatch is true, only exact matches are returned; otherwise, partial matches are included.
 func (file *File) Search(field *Field, exactMatch bool) ([]*Row, error) {
+	if err := file.beginRead(); err != nil {
+		return nil, err
+	}
+	defer file.mu.RUnlock()
 	return file.defaults().io.Search(file, field, exactMatch)
 }
 
 // GoTo sets the internal row pointer to the specified row number.
 // Returns an EOF error if positioning beyond the end of file and positions the pointer at lastRow+1.
 func (file *File) GoTo(row uint32) error {
+	if err := file.beginWrite(); err != nil {
+		return err
+	}
+	defer file.mu.Unlock()
+	return file.defaults().io.GoTo(file, row)
+}
+
+// goToLocked performs GoTo without locking; callers must hold Lock.
+func (file *File) goToLocked(row uint32) error {
 	return file.defaults().io.GoTo(file, row)
 }
 
@@ -178,11 +265,20 @@ func (file *File) GoTo(row uint32) error {
 // If the result would be negative, positions the pointer at 0.
 // Note: This method does not skip deleted rows automatically.
 func (file *File) Skip(offset int64) {
+	file.mu.Lock()
+	defer file.mu.Unlock()
+	if file.closed {
+		return
+	}
 	file.defaults().io.Skip(file, offset)
 }
 
 // Deleted returns true if the row at the current internal row pointer position is marked as deleted.
 func (file *File) Deleted() (bool, error) {
+	if err := file.beginRead(); err != nil {
+		return false, err
+	}
+	defer file.mu.RUnlock()
 	return file.defaults().io.Deleted(file)
 }
 

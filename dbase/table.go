@@ -7,7 +7,6 @@ import (
 	"math/big"
 	"reflect"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -315,15 +314,24 @@ func (row *Row) ToBytes() ([]byte, error) {
 	varPos := 0
 	nullFlag := make([]byte, 1)
 	for _, field := range row.fields {
-		val, err := row.handle.Represent(field, false)
+		val, err := row.handle.representLocked(field, false)
 		if err != nil {
 			return nil, WrapError(err)
 		}
 		// Get null and length if variable length field
 		if field.column.DataType == byte(Varbinary) || field.column.DataType == byte(Varchar) {
+			// A nil value is SQL NULL for nullable variable fields; an empty
+			// string/slice is a distinct zero length value and must not set
+			// the null bit.
+			isNull := field.GetValue() == nil
 			length := len(val)
 			// Not null and not full size
-			if length < int(field.column.Length) && length > 0 {
+			if isNull && field.column.Flag.Has(byte(NullableFlag)) {
+				debugf("Variable length field %v is null", field.column.Name())
+				byteIndex := varPos / 8
+				bitIndex := varPos % 8
+				nullFlag[byteIndex] = setNthBit(nullFlag[byteIndex], bitIndex+1)
+			} else if length < int(field.column.Length) && length > 0 {
 				debugf("Variable length field %v is not null and not full size (%v < %v)", field.column.Name(), length, field.column.Length)
 				// Set last byte as length
 				buf := make([]byte, field.column.Length)
@@ -334,12 +342,6 @@ func (row *Row) ToBytes() ([]byte, error) {
 				byteIndex := varPos / 8
 				bitIndex := varPos % 8
 				nullFlag[byteIndex] = setNthBit(nullFlag[byteIndex], bitIndex)
-			} else if length == 0 { // Null
-				debugf("Variable length field %v is null", field.column.Name())
-				// Set null flag
-				byteIndex := varPos / 8
-				bitIndex := varPos % 8
-				nullFlag[byteIndex] = setNthBit(nullFlag[byteIndex], bitIndex+1)
 			}
 			// Increase variable field in nullFlag position, increase by one for length and another one for null flag
 			varPos++
@@ -561,8 +563,6 @@ func NewTable(version FileVersion, config *Config, columns []*Column, memoBlockS
 		table: &Table{
 			columns: make([]*Column, 0),
 		},
-		dbaseMutex: &sync.Mutex{},
-		memoMutex:  &sync.Mutex{},
 	}
 	debugf("Creating new DBF file: %v - type: %v - year: %v - month: %v - day: %v - first row: %v - row length: %v - code page: %v - columns: %v", config.Filename, file.header.FileType, file.header.Year, file.header.Month, file.header.Day, file.header.FirstRow, file.header.RowLength, file.header.CodePage, len(columns))
 	// Determines how many bytes are needed for the _NullFlag field if needed
@@ -593,12 +593,17 @@ func NewTable(version FileVersion, config *Config, columns []*Column, memoBlockS
 	}
 	// If there are memo fields, add the memo header
 	if memoField {
-		file.memoHeader = &MemoHeader{
-			NextFree:  0,
-			Unused:    [2]byte{0x00, 0x00},
-			BlockSize: memoBlockSize,
+		blockSize := memoBlockSize
+		if blockSize == 0 {
+			blockSize = 64
 		}
-		debugf("Initializing related memo file header - block size: %v", file.memoHeader.BlockSize)
+		file.memoHeader = &MemoHeader{
+			NextFree:  firstMemoDataBlock(blockSize),
+			Unused:    [2]byte{0x00, 0x00},
+			BlockSize: blockSize,
+		}
+		debugf("Initializing related memo file header - block size: %v, first data block: %d",
+			file.memoHeader.BlockSize, file.memoHeader.NextFree)
 	}
 	// If there are nullable or variable length fields, add the null flag column
 	if nullFlagLength > 0 {

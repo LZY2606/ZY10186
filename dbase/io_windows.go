@@ -6,12 +6,12 @@ package dbase
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -54,11 +54,9 @@ func (w WindowsIO) initFile(config *Config) (*File, error) {
 		return nil, NewErrorf("opening DBF file %v failed", config.Filename).Details(err)
 	}
 	return &File{
-		config:     config,
-		io:         w,
-		handle:     &fd,
-		dbaseMutex: &sync.Mutex{},
-		memoMutex:  &sync.Mutex{},
+		config: config,
+		io:     w,
+		handle: &fd,
 	}, nil
 }
 
@@ -90,6 +88,24 @@ func (w WindowsIO) initTable(config *Config, file *File) error {
 	// Check if the code page mark is matchin the converter
 	if config.ValidateCodePage && file.header.CodePage != file.config.Converter.CodePage() {
 		return NewErrorf("code page mark mismatch: %d != %d", file.header.CodePage, file.config.Converter.CodePage())
+	}
+	var size int64 = -1
+	var sizeErr error
+	if handle, ok := file.handle.(*windows.Handle); ok {
+		var previous int64
+		previous, sizeErr = windows.Seek(*handle, 0, io.SeekCurrent)
+		if sizeErr == nil {
+			size, sizeErr = windows.Seek(*handle, 0, io.SeekEnd)
+			if sizeErr == nil {
+				_, sizeErr = windows.Seek(*handle, previous, io.SeekStart)
+			}
+		}
+	}
+	if err := validateDeclaredSize(file, size); err != nil {
+		return err
+	}
+	if size < 0 && sizeErr != nil {
+		return WrapError(sizeErr)
 	}
 	return nil
 }
@@ -453,6 +469,16 @@ func (w WindowsIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 	if block == 0 {
 		return []byte{}, false, nil
 	}
+	memoSize := int64(-1)
+	if previous, sizeErr := windows.Seek(*relatedHandle, 0, io.SeekCurrent); sizeErr == nil {
+		if size, endErr := windows.Seek(*relatedHandle, 0, io.SeekEnd); endErr == nil {
+			memoSize = size
+			_, _ = windows.Seek(*relatedHandle, previous, io.SeekStart)
+		}
+	}
+	if err := validateMemoPointer(file, block, memoSize); err != nil {
+		return nil, false, WrapError(err)
+	}
 	position := int64(file.memoHeader.BlockSize) * int64(block)
 	debugf("Reading memo block %d at position %d", block, position)
 	// The position in the file is blocknumber*blocksize
@@ -464,9 +490,12 @@ func (w WindowsIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 	// uints in one buffer and then convert, this saves seconds for large DBF files with many memo columns
 	// as it avoids using the reflection in binary.Read
 	hbuf := make([]byte, 8)
-	_, err = windows.Read(*relatedHandle, hbuf)
+	n, err := windows.Read(*relatedHandle, hbuf)
 	if err != nil {
 		return nil, false, NewErrorf("reading memo block header failed").Details(err)
+	}
+	if n != 8 {
+		return nil, false, NewErrorf("memo block %d header truncated: read %d of 8 bytes", block, n).Details(ErrMemoOutOfBounds)
 	}
 	sign := binary.BigEndian.Uint32(hbuf[:4])
 	leng := binary.BigEndian.Uint32(hbuf[4:])
@@ -482,12 +511,12 @@ func (w WindowsIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 		return buf, sign == 1, NewErrorf("reading memo block data failed").Details(err)
 	}
 	if read != int(leng) {
-		return buf, sign == 1, NewErrorf("read %d bytes, expected %d", read, leng)
+		return buf, sign == 1, NewErrorf("read %d bytes, expected %d", read, leng).Details(ErrMemoOutOfBounds)
 	}
 	if sign == 1 || !column.Flag.Has(byte(BinaryFlag)) {
 		buf, err = file.config.Converter.Decode(buf)
 		if err != nil {
-			return buf, sign == 1, WrapError(err)
+			return buf, sign == 1, NewError("failed to decode memo data").Details(ErrInvalidEncoding).Details(err)
 		}
 	}
 	return buf, sign == 1, nil
@@ -504,21 +533,15 @@ func (w WindowsIO) WriteMemo(address []byte, file *File, raw []byte, text bool, 
 	if err != nil {
 		return nil, WrapError(err)
 	}
-	blocks := 1
 	blockPosition := file.memoHeader.NextFree
-	if length > 0 && file.memoHeader.BlockSize > 0 {
-		blocks = length / int(file.memoHeader.BlockSize)
-		if length%int(file.memoHeader.BlockSize) > 0 {
-			blocks++
-		}
-	}
+	blocks := memoBlocksNeeded(length, file.memoHeader.BlockSize)
 	if !isEmptyBytes(address) {
 		debugf("memo address is not empty, writing to block %d", binary.LittleEndian.Uint32(address))
 		blockPosition = binary.LittleEndian.Uint32(address)
 		blocks = 0
 	}
 	// Write the memo header
-	err = file.WriteMemoHeader(blocks)
+	err = file.WriteMemoHeader(int(blocks))
 	if err != nil {
 		return nil, WrapError(err)
 	}
@@ -638,7 +661,8 @@ func (w WindowsIO) ReadRow(file *File, position uint32) ([]byte, error) {
 		return buf, NewErrorf("reading row %d failed", position).Details(err)
 	}
 	if read != int(file.header.RowLength) {
-		return buf, NewErrorf("read %d bytes, expected %d", read, file.header.RowLength)
+		return buf, NewErrorf("row %d truncated at offset %d: read %d of %d bytes",
+			position, pos, read, file.header.RowLength).Details(ErrRowTruncated)
 	}
 	return buf, nil
 }
@@ -646,8 +670,6 @@ func (w WindowsIO) ReadRow(file *File, position uint32) ([]byte, error) {
 // writeRow writes raw row data to the given row position
 func (w WindowsIO) WriteRow(file *File, row *Row) (err error) {
 	debugf("Writing row: %d ...", row.Position)
-	row.handle.dbaseMutex.Lock()
-	defer row.handle.dbaseMutex.Unlock()
 	handle, err := w.getHandle(file)
 	if err != nil {
 		return WrapError(err)
@@ -657,24 +679,19 @@ func (w WindowsIO) WriteRow(file *File, row *Row) (err error) {
 	if err != nil {
 		return WrapError(err)
 	}
-	// Update the header
+	appending := row.Position >= row.handle.header.RowsCount
 	position := int64(row.handle.header.FirstRow) + (int64(row.Position) * int64(row.handle.header.RowLength))
-	if row.Position >= row.handle.header.RowsCount {
+	if appending {
 		// Check if we're exceeding the maximum records per table
 		if row.handle.header.RowsCount >= MaxRecordsPerTable {
 			return NewErrorf("maximum records per table exceeded: %d >= %d", row.handle.header.RowsCount, MaxRecordsPerTable)
 		}
 		position = int64(row.handle.header.FirstRow) + (int64(row.Position-1) * int64(row.handle.header.RowLength))
-		row.handle.header.RowsCount++
-		// Check if the new file size would exceed the maximum
-		if err := row.handle.header.ValidateFileSize(); err != nil {
-			row.handle.header.RowsCount-- // Rollback the increment
+		probe := *row.handle.header
+		probe.RowsCount++
+		if err := probe.ValidateFileSize(); err != nil {
 			return WrapError(err)
 		}
-	}
-	err = row.handle.WriteHeader()
-	if err != nil {
-		return WrapError(err)
 	}
 	// Lock the block we are writing to
 	if row.handle.config.WriteLock {
@@ -700,9 +717,22 @@ func (w WindowsIO) WriteRow(file *File, row *Row) (err error) {
 		return NewErrorf("seeking to position %d failed", position).Details(err)
 	}
 	// Write the row
-	_, err = windows.Write(*handle, r)
+	wrote, err := windows.Write(*handle, r)
 	if err != nil {
 		return NewErrorf("writing row %d failed", row.Position).Details(err)
+	}
+	if wrote != len(r) {
+		return NewErrorf("wrote %d bytes, expected %d", wrote, len(r))
+	}
+	// Commit the record count last. If this fails the row bytes sit as
+	// unreferenced tail bytes but header, memory and reopen view stay consistent.
+	if appending {
+		previousCount := row.handle.header.RowsCount
+		row.handle.header.RowsCount++
+		if err := row.handle.WriteHeader(); err != nil {
+			row.handle.header.RowsCount = previousCount
+			return WrapError(err)
+		}
 	}
 	return nil
 }
@@ -717,7 +747,7 @@ func (w WindowsIO) Search(file *File, field *Field, exactMatch bool) ([]*Row, er
 	}
 	debugf("Searching for value: %v in field: %s", field.GetValue(), field.column.Name())
 	// convert the value to bytes
-	val, err := file.Represent(field, !exactMatch)
+	val, err := file.representLocked(field, !exactMatch)
 	if err != nil {
 		return nil, WrapError(err)
 	}
@@ -744,11 +774,11 @@ func (w WindowsIO) Search(file *File, field *Field, exactMatch bool) ([]*Row, er
 		// Check if the value matches
 		if bytes.Contains(buf, val) {
 			debugf("Found matching field at position: %d - Record %v position: %v ", p, i+1, p-int64(field.column.Position))
-			err := file.GoTo(i)
+			err := file.goToLocked(i)
 			if err != nil {
 				continue
 			}
-			row, err := file.Row()
+			row, err := file.rowLocked()
 			if err != nil {
 				continue
 			}
@@ -772,9 +802,11 @@ func (w WindowsIO) Skip(file *File, offset int64) {
 	newval := int64(file.table.rowPointer) + offset
 	if newval >= int64(file.header.RowsCount) {
 		file.table.rowPointer = file.header.RowsCount
+		return
 	}
 	if newval < 0 {
 		file.table.rowPointer = 0
+		return
 	}
 	file.table.rowPointer = uint32(newval)
 	debugf("Skipping %d row/s, new position: %d", offset, file.table.rowPointer)

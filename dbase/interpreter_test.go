@@ -410,7 +410,7 @@ func TestFile_getDateRepresentation(t *testing.T) {
 	if len(result) != 8 {
 		t.Errorf("Expected 8 bytes, got %d", len(result))
 	}
-	if (string(result) != "20250101") {
+	if string(result) != "20250101" {
 		t.Errorf("Expected result to be '20250101' got %s", string(result))
 	}
 }
@@ -436,7 +436,7 @@ func TestFile_getDateRepresentationForEmptyDate(t *testing.T) {
 	if len(result) != 8 {
 		t.Errorf("Expected 8 bytes, got %d", len(result))
 	}
-	if (string(result) != strings.Repeat(" ", 8)) {
+	if string(result) != strings.Repeat(" ", 8) {
 		t.Errorf("Expected result to be a string of 8 spaces got %s", string(result))
 	}
 }

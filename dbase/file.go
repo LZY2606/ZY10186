@@ -10,17 +10,18 @@ import (
 // File is the main struct to handle a dBase file.
 // Each file type is basically a Table or a Memo file.
 type File struct {
-	config         *Config     // The config used when working with the DBF file.
-	handle         interface{} // DBase file handle.
-	relatedHandle  interface{} // Memo file handle.
-	io             IO          // The IO interface used to work with the DBF file.
-	header         *Header     // DBase file header containing relevant information.
-	memoHeader     *MemoHeader // Memo file header containing relevant information.
-	dbaseMutex     *sync.Mutex // Mutex locks for concurrent writing access to the DBF file.
-	memoMutex      *sync.Mutex // Mutex locks for concurrent writing access to the FPT file.
-	table          *Table      // Containing the columns and internal row pointer.
-	nullFlagColumn *Column     // The column containing the null flag column (if varchar or varbinary field exists).
+	config         *Config      // The config used when working with the DBF file.
+	handle         interface{}  // DBase file handle.
+	relatedHandle  interface{}  // Memo file handle.
+	io             IO           // The IO interface used to work with the DBF file.
+	header         *Header      // DBase file header containing relevant information.
+	memoHeader     *MemoHeader  // Memo file header containing relevant information.
+	mu             sync.RWMutex // Serialises File entry points: readers hold RLock, mutators and Close hold Lock.
+	memoMutex      sync.Mutex   // Serialises FPT block allocation between concurrent writers.
+	table          *Table       // Containing the columns and internal row pointer.
+	nullFlagColumn *Column      // The column containing the null flag column (if varchar or varbinary field exists).
 	isNew          bool
+	closed         bool // Set by Close; every subsequent entry point returns ErrClosed.
 }
 
 // TableName returns the name of the dBase table.
@@ -30,26 +31,36 @@ func (file *File) TableName() string {
 
 // EOF returns true if the internal row pointer is at the end of file.
 func (file *File) EOF() bool {
+	file.mu.RLock()
+	defer file.mu.RUnlock()
 	return file.table.rowPointer >= file.header.RowsCount
 }
 
 // BOF returns true if the internal row pointer is before the first row.
 func (file *File) BOF() bool {
+	file.mu.RLock()
+	defer file.mu.RUnlock()
 	return file.table.rowPointer == 0
 }
 
 // Pointer returns the current row pointer position.
 func (file *File) Pointer() uint32 {
+	file.mu.RLock()
+	defer file.mu.RUnlock()
 	return file.table.rowPointer
 }
 
 // Header returns the dBase file header struct for inspection.
 func (file *File) Header() *Header {
+	file.mu.RLock()
+	defer file.mu.RUnlock()
 	return file.header
 }
 
 // RowsCount returns the number of rows in the dBase file.
 func (file *File) RowsCount() uint32 {
+	file.mu.RLock()
+	defer file.mu.RUnlock()
 	return file.header.RowsCount
 }
 
@@ -155,39 +166,75 @@ func (file *File) Init() error {
 // Rows returns all rows in the dBase file as a slice.
 // If skipInvalid is true, invalid rows are skipped instead of returning an error.
 // If skipDeleted is true, deleted rows are excluded from the result.
+// Rows performs its own full table scan starting at record 0 and restores the
+// entry row pointer afterwards, so it does not depend on (or disturb) the
+// caller's cursor.
 func (file *File) Rows(skipInvalid bool, skipDeleted bool) ([]*Row, error) {
+	if err := file.beginWrite(); err != nil {
+		return nil, err
+	}
+	defer file.mu.Unlock()
+	savedPointer := file.table.rowPointer
+	file.table.rowPointer = 0
+	defer func() { file.table.rowPointer = savedPointer }()
 	rows := make([]*Row, 0)
-	for !file.EOF() {
-		row, err := file.Next()
+	for file.table.rowPointer < file.header.RowsCount {
+		row, err := file.nextLocked()
 		if err != nil {
 			if skipInvalid {
+				// A failed decode must not stall the cursor forever; advance
+				// past the bad record so iteration can continue.
+				file.defaults().io.Skip(file, 1)
 				continue
 			}
 			return nil, WrapError(err)
 		}
 
 		// skip deleted rows
-		if row.Deleted && skipDeleted {
-			continue
+		if !row.Deleted || !skipDeleted {
+			rows = append(rows, row)
 		}
-		rows = append(rows, row)
 	}
 	return rows, nil
 }
 
 // Next reads the current row and increments the row pointer by one.
 func (file *File) Next() (*Row, error) {
-	row, err := file.Row()
-	file.Skip(1)
+	if err := file.beginWrite(); err != nil {
+		return nil, err
+	}
+	defer file.mu.Unlock()
+	row, err := file.nextLocked()
 	if err != nil {
 		return nil, WrapError(err)
 	}
 	return row, err
 }
 
+// nextLocked reads and decodes the current row and advances the pointer only
+// when the read succeeded. Callers must hold Lock.
+func (file *File) nextLocked() (*Row, error) {
+	row, err := file.rowLocked()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	file.defaults().io.Skip(file, 1)
+	return row, nil
+}
+
 // Row returns the row at the current file row pointer position.
 func (file *File) Row() (*Row, error) {
-	data, err := file.ReadRow(file.table.rowPointer)
+	if err := file.beginRead(); err != nil {
+		return nil, err
+	}
+	defer file.mu.RUnlock()
+	return file.rowLocked()
+}
+
+// rowLocked returns the row at the current pointer without locking.
+// Callers must hold RLock or Lock.
+func (file *File) rowLocked() (*Row, error) {
+	data, err := file.readRowLocked(file.table.rowPointer)
 	if err != nil {
 		return nil, WrapError(err)
 	}
@@ -247,14 +294,16 @@ func (file *File) BytesToRow(data []byte) (*Row, error) {
 	// a row should start with te delete flag, a space ACTIVE(0x20) or DELETED(0x2A)
 	rec.Deleted = Marker(data[0]) == Deleted
 	if !rec.Deleted && Marker(data[0]) != Active {
-		return nil, NewError("invalid row data, no delete flag found at beginning of row")
+		return nil, NewErrorf("invalid delete marker 0x%02x at row %d offset %d (expected 0x20 or 0x2a)",
+			data[0], rec.Position, int64(file.header.FirstRow)+int64(rec.Position)*int64(file.header.RowLength)).
+			Details(ErrInvalidMarker)
 	}
 	// deleted flag already read
 	offset := uint16(1)
 	for i := 0; i < int(file.ColumnsCount()); i++ {
 		column := file.table.columns[i]
 		raw := data[offset : offset+uint16(column.Length)]
-		val, err := file.Interpret(raw, file.table.columns[i])
+		val, err := file.interpretLocked(raw, file.table.columns[i])
 		if err != nil {
 			return nil, WrapError(err)
 		}

@@ -23,6 +23,18 @@ var (
 	ErrInvalidEncoding = errors.New("INVALID_ENCODING")
 	// ErrUnknownDataType is returned when an invalid data type is used
 	ErrUnknownDataType = errors.New("UNKNOWN_DATA_TYPE")
+	// ErrClosed is returned when an operation is attempted on a closed table.
+	ErrClosed = errors.New("DBF_CLOSED")
+	// ErrRowTruncated is returned when a record slot is shorter than the header declared row length.
+	ErrRowTruncated = errors.New("ROW_TRUNCATED")
+	// ErrTableTruncated is returned when the file ends before all rows declared in the header.
+	ErrTableTruncated = errors.New("TABLE_TRUNCATED")
+	// ErrInvalidMarker is returned when a record does not start with the active (0x20) or deleted (0x2A) marker.
+	ErrInvalidMarker = errors.New("INVALID_DELETE_MARKER")
+	// ErrMemoOutOfBounds is returned when a memo pointer references a block outside the memo file.
+	ErrMemoOutOfBounds = errors.New("MEMO_OUT_OF_BOUNDS")
+	// ErrMemoFree is returned when a memo pointer references the free space beyond the last used block.
+	ErrMemoFree = errors.New("MEMO_FREE_BLOCK")
 )
 
 // Error is a wrapper for errors that occur in the dbase package
@@ -79,6 +91,15 @@ func (e Error) Error() string {
 	}
 
 	return fmt.Sprintf("%s %s", e.msg, details)
+}
+
+// Unwrap returns all wrapped detail errors so errors.Is/errors.As traverse the
+// detailed causes as well.
+func (e Error) Unwrap() []error {
+	if len(e.details) == 0 {
+		return nil
+	}
+	return e.details
 }
 
 // WrapError wraps an existing error into a dbase Error with trace information.

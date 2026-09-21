@@ -47,14 +47,13 @@ func (b *BytesReadWriteSeeker) Read(p []byte) (n int, err error) {
 // Note: For dBase file reading, write operations are typically not needed,
 // but this implementation allows the interface to be satisfied.
 func (b *BytesReadWriteSeeker) Write(p []byte) (n int, err error) {
-	if b.pos < 0 || b.pos > int64(len(b.data)) {
+	if b.pos < 0 {
 		return 0, fmt.Errorf("invalid seek position: %d", b.pos)
 	}
-
-	// If writing beyond current data, extend the slice
+	// Extend with zero fill when writing at or beyond the current length, so
+	// sparse writes after Seek behave the same as on an OS file.
 	endPos := b.pos + int64(len(p))
 	if endPos > int64(len(b.data)) {
-		// Extend the data slice
 		newData := make([]byte, endPos)
 		copy(newData, b.data)
 		b.data = newData

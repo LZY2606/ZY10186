@@ -86,7 +86,7 @@ type Config struct {
 func (c *Config) validateDataSources() error {
 	sources := 0
 	var sourcesSet []string
-	
+
 	if c.Filename != "" {
 		sources++
 		sourcesSet = append(sourcesSet, "Filename")
@@ -103,14 +103,14 @@ func (c *Config) validateDataSources() error {
 		sources++
 		sourcesSet = append(sourcesSet, "IO")
 	}
-	
+
 	if sources == 0 {
 		return NewError("no data source provided: must set exactly one of Filename, Data, Reader, or IO")
 	}
 	if sources > 1 {
 		return NewErrorf("multiple data sources provided (%v): must set exactly one of Filename, Data, Reader, or IO", sourcesSet)
 	}
-	
+
 	return nil
 }
 

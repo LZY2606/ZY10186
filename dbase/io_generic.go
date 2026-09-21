@@ -3,13 +3,13 @@ package dbase
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -32,8 +32,6 @@ func (g GenericIO) OpenTable(config *Config) (*File, error) {
 		io:            g,
 		handle:        g.Handle,
 		relatedHandle: g.RelatedHandle,
-		dbaseMutex:    &sync.Mutex{},
-		memoMutex:     &sync.Mutex{},
 	}
 	err := file.ReadHeader()
 	if err != nil {
@@ -65,6 +63,15 @@ func (g GenericIO) OpenTable(config *Config) (*File, error) {
 	// Check if the code page mark is matchin the converter
 	if config.ValidateCodePage && file.header.CodePage != file.config.Converter.CodePage() {
 		return nil, NewErrorf("code page mark mismatch: %d != %d", file.header.CodePage, file.config.Converter.CodePage())
+	}
+	size := int64(-1)
+	if seeker, ok := g.Handle.(io.Seeker); ok {
+		if resolved, err := seekerSize(seeker); err == nil {
+			size = resolved
+		}
+	}
+	if err := validateDeclaredSize(file, size); err != nil {
+		return nil, WrapError(err)
 	}
 
 	// Check if there is an FPT according to the header.
@@ -339,6 +346,9 @@ func (g GenericIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 	if block == 0 {
 		return []byte{}, false, nil
 	}
+	if err := validateMemoPointer(file, block, memoStoreSize(relatedHandle)); err != nil {
+		return nil, false, WrapError(err)
+	}
 	position := int64(file.memoHeader.BlockSize) * int64(block)
 	debugf("Reading memo block %d at position %d", block, position)
 	// The position in the file is blocknumber*blocksize
@@ -373,7 +383,7 @@ func (g GenericIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 	if sign == 1 || !column.Flag.Has(byte(BinaryFlag)) {
 		buf, err = file.config.Converter.Decode(buf)
 		if err != nil {
-			return buf, sign == 1, NewErrorf("failed to decode memo data").Details(err)
+			return buf, sign == 1, NewErrorf("failed to decode memo data").Details(ErrInvalidEncoding).Details(err)
 		}
 	}
 	return buf, sign == 1, nil
@@ -391,20 +401,14 @@ func (g GenericIO) WriteMemo(address []byte, file *File, raw []byte, text bool, 
 		return nil, WrapError(err)
 	}
 	// Get the block position
-	blocks := 1
 	blockPosition := file.memoHeader.NextFree
-	if length > 0 && file.memoHeader.BlockSize > 0 {
-		blocks = length / int(file.memoHeader.BlockSize)
-		if length%int(file.memoHeader.BlockSize) > 0 {
-			blocks++
-		}
-	}
+	blocks := memoBlocksNeeded(length, file.memoHeader.BlockSize)
 	if !isEmptyBytes(address) {
 		blockPosition = binary.LittleEndian.Uint32(address)
 		blocks = 0
 	}
 	// Write the memo header
-	err = file.WriteMemoHeader(blocks)
+	err = file.WriteMemoHeader(int(blocks))
 	if err != nil {
 		return nil, WrapError(err)
 	}
@@ -487,18 +491,21 @@ func (g GenericIO) ReadRow(file *File, position uint32) ([]byte, error) {
 	}
 	read, err := handle.Read(buf)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return buf, NewErrorf("row %d truncated at offset %d: read %d of %d bytes",
+				position, pos, read, file.header.RowLength).Details(ErrRowTruncated)
+		}
 		return buf, NewErrorf("failed to read row data").Details(err)
 	}
 	if read != int(file.header.RowLength) {
-		return buf, NewErrorf("read %d bytes, expected %d", read, file.header.RowLength)
+		return buf, NewErrorf("row %d truncated at offset %d: read %d of %d bytes",
+			position, pos, read, file.header.RowLength).Details(ErrRowTruncated)
 	}
 	return buf, nil
 }
 
 func (g GenericIO) WriteRow(file *File, row *Row) error {
 	debugf("Writing row: %d ...", row.Position)
-	row.handle.dbaseMutex.Lock()
-	defer row.handle.dbaseMutex.Unlock()
 	handle, err := g.getHandle(file)
 	if err != nil {
 		return WrapError(err)
@@ -508,24 +515,19 @@ func (g GenericIO) WriteRow(file *File, row *Row) error {
 	if err != nil {
 		return WrapError(err)
 	}
-	// Update the header
+	appending := row.Position >= row.handle.header.RowsCount
 	position := int64(row.handle.header.FirstRow) + (int64(row.Position) * int64(row.handle.header.RowLength))
-	if row.Position >= row.handle.header.RowsCount {
+	if appending {
 		// Check if we're exceeding the maximum records per table
 		if row.handle.header.RowsCount >= MaxRecordsPerTable {
 			return NewErrorf("maximum records per table exceeded: %d >= %d", row.handle.header.RowsCount, MaxRecordsPerTable)
 		}
 		position = int64(row.handle.header.FirstRow) + (int64(row.Position-1) * int64(row.handle.header.RowLength))
-		row.handle.header.RowsCount++
-		// Check if the new file size would exceed the maximum
-		if err := row.handle.header.ValidateFileSize(); err != nil {
-			row.handle.header.RowsCount-- // Rollback the increment
+		probe := *row.handle.header
+		probe.RowsCount++
+		if err := probe.ValidateFileSize(); err != nil {
 			return WrapError(err)
 		}
-	}
-	err = row.handle.WriteHeader()
-	if err != nil {
-		return WrapError(err)
 	}
 	debugf("Writing row: %d at offset: %v", row.Position, position)
 	// Seek to the correct position
@@ -534,9 +536,22 @@ func (g GenericIO) WriteRow(file *File, row *Row) error {
 		return NewErrorf("failed to seek to position %d", position).Details(err)
 	}
 	// Write the row
-	_, err = handle.Write(r)
+	wrote, err := handle.Write(r)
 	if err != nil {
 		return NewErrorf("failed to write row data").Details(err)
+	}
+	if wrote != len(r) {
+		return NewErrorf("wrote %d bytes, expected %d", wrote, len(r))
+	}
+	// Commit the record count last. If this fails the row bytes sit as
+	// unreferenced tail bytes but header, memory and reopen view stay consistent.
+	if appending {
+		previousCount := row.handle.header.RowsCount
+		row.handle.header.RowsCount++
+		if err := row.handle.WriteHeader(); err != nil {
+			row.handle.header.RowsCount = previousCount
+			return WrapError(err)
+		}
 	}
 	return nil
 }
@@ -551,7 +566,7 @@ func (g GenericIO) Search(file *File, field *Field, exactMatch bool) ([]*Row, er
 	}
 	debugf("Searching for value: %v in field: %s", field.GetValue(), field.column.Name())
 	// convert the value to bytes
-	val, err := file.Represent(field, !exactMatch)
+	val, err := file.representLocked(field, !exactMatch)
 	if err != nil {
 		return nil, WrapError(err)
 	}
@@ -578,11 +593,11 @@ func (g GenericIO) Search(file *File, field *Field, exactMatch bool) ([]*Row, er
 		// Check if the value matches
 		if bytes.Contains(buf, val) {
 			debugf("Found matching field at position: %d - Record %v position: %v ", p, i+1, p-int64(field.column.Position))
-			err := file.GoTo(i)
+			err := file.goToLocked(i)
 			if err != nil {
 				continue
 			}
-			row, err := file.Row()
+			row, err := file.rowLocked()
 			if err != nil {
 				continue
 			}
@@ -606,9 +621,11 @@ func (g GenericIO) Skip(file *File, offset int64) {
 	newval := int64(file.table.rowPointer) + offset
 	if newval >= int64(file.header.RowsCount) {
 		file.table.rowPointer = file.header.RowsCount
+		return
 	}
 	if newval < 0 {
 		file.table.rowPointer = 0
+		return
 	}
 	file.table.rowPointer = uint32(newval)
 	debugf("Skipping %d row/s, new position: %d", offset, file.table.rowPointer)

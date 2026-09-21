@@ -34,7 +34,18 @@ import (
 // | Y | Currency | float64 |
 //
 // Not all available column types have been implemented because we don't use them in our DBFs
+// Interpret is the lock taking public entry point; see interpretLocked.
 func (file *File) Interpret(raw []byte, column *Column) (interface{}, error) {
+	if err := file.beginRead(); err != nil {
+		return nil, err
+	}
+	defer file.mu.RUnlock()
+	return file.interpretLocked(raw, column)
+}
+
+// interpretLocked converts raw column data to the correct type for the given
+// column. Callers must hold RLock or Lock.
+func (file *File) interpretLocked(raw []byte, column *Column) (interface{}, error) {
 	if len(raw) != int(column.Length) {
 		return nil, NewErrorf("invalid length %v Bytes != %v Bytes at column field: %v", len(raw), column.Length, column.Name())
 	}
@@ -91,6 +102,16 @@ func (file *File) Interpret(raw []byte, column *Column) (interface{}, error) {
 // Represent converts column data to the byte representation of the columns data type
 // For M values the data is written to the memo file and the address is returned
 func (file *File) Represent(field *Field, padding bool) ([]byte, error) {
+	if err := file.beginWrite(); err != nil {
+		return nil, err
+	}
+	defer file.mu.Unlock()
+	return file.representLocked(field, padding)
+}
+
+// representLocked converts a field to its byte representation.
+// Callers must hold Lock.
+func (file *File) representLocked(field *Field, padding bool) ([]byte, error) {
 	if field.GetValue() == nil {
 		return make([]byte, field.column.Length), nil
 	}
@@ -149,7 +170,7 @@ func (file *File) parseMemo(raw []byte, column *Column) (interface{}, error) {
 	if isEmptyBytes(raw) {
 		return []byte{}, nil
 	}
-	memo, isText, err := file.ReadMemo(raw, column)
+	memo, isText, err := file.readMemoLocked(raw, column)
 	if err != nil {
 		return nil, NewErrorf("parsing memo failed at column field: %v failed", column.Name()).Details(err)
 	}
@@ -184,7 +205,7 @@ func (file *File) getMemoRepresentation(field *Field, _ bool) ([]byte, error) {
 	if !ok && !sok {
 		return nil, NewErrorf("invalid type for memo field: %T", field.value)
 	}
-	address, err := file.WriteMemo(field.memoPos, memo, txt, len(memo))
+	address, err := file.writeMemoLocked(field.memoPos, memo, txt, len(memo))
 	if err != nil {
 		return nil, WrapError(err)
 	}
@@ -197,12 +218,15 @@ func (file *File) parseCharacter(raw []byte, column *Column) (interface{}, error
 		return "", nil
 	}
 	if len(raw) > MaxCharacterLength {
+		// Kept for compatibility: this branch is unreachable from real files
+		// (raw length always equals column.Length, capped at 254) and the
+		// existing contract returns the error as the value with a nil error.
 		return NewErrorf("invalid length %v bytes > %v bytes at column field: %v", len(raw), MaxCharacterLength, column.Name()), nil
 	}
 	// C values are stored as strings, the returned string is not trimmed
 	str, err := toUTF8String(raw, file.config.Converter)
 	if err != nil {
-		return str, NewErrorf("parsing to utf8 string failed at column field: %v failed", column.Name()).Details(err)
+		return "", NewErrorf("decoding character field %v failed", column.Name()).Details(ErrInvalidEncoding).Details(err)
 	}
 	return str, nil
 }
@@ -543,7 +567,7 @@ func (file *File) getNumericRepresentation(field *Field, skipSpacing bool) ([]by
 }
 
 func (file *File) parseVarchar(raw []byte, column *Column) (interface{}, error) {
-	varlen, null, err := file.ReadNullFlag(uint64(file.table.rowPointer), column)
+	varlen, null, err := file.readNullFlagLocked(uint64(file.table.rowPointer), column)
 	if err != nil {
 		return nil, NewErrorf("reading null flag at column field: %v failed", column.Name()).Details(err)
 	}
@@ -570,7 +594,7 @@ func (file *File) getVarcharRepresentation(field *Field, _ bool) ([]byte, error)
 }
 
 func (file *File) parseVarbinary(raw []byte, column *Column) (interface{}, error) {
-	varlen, null, err := file.ReadNullFlag(uint64(file.table.rowPointer), column)
+	varlen, null, err := file.readNullFlagLocked(uint64(file.table.rowPointer), column)
 	if err != nil {
 		return nil, NewErrorf("reading null flag at column field: %v failed", column.Name()).Details(err)
 	}

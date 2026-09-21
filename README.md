@@ -11,14 +11,14 @@
 
 ## Overview
 
-This package provides comprehensive tools for working with dBase-format database files (.DBF) and their associated memo files (.FPT). It offers cross-platform compatibility with optimized I/O operations for both Unix and Windows systems, flexible data representation, and safe concurrent operations.
+This package provides comprehensive tools for working with dBase-format database files (.DBF) and their associated memo files (.FPT). It offers cross-platform compatibility with optimized I/O operations for both Unix and Windows systems, flexible data representation, and lock-protected read/write entry points (the precise concurrency boundary is documented in [docs/architecture.md](docs/architecture.md)).
 
 ### Key Features
 
 - 📁 **Full dBase Support**: Read and write .DBF tables and .FPT memo files
 - 🔄 **Multiple File Versions**: Support for FoxPro, FoxBase, and dBase III/IV formats  
 - 🌐 **Encoding Support**: 13+ character encodings with automatic code page detection
-- 🔒 **Concurrent Safe**: Built-in synchronization for multi-threaded applications
+- 🔒 **Concurrent Reads/Writes**: The public read and write entry points are synchronized with an RWMutex; see [docs/architecture.md](docs/architecture.md) for the exact boundary (the raw header/column primitives are not lock protected)
 - 📊 **Flexible Output**: Convert to Go structs, JSON, maps, or native types
 - 🔍 **Advanced Features**: Search, navigation, exclusive file access, and table creation
 - ⚡ **Memory Efficient**: Streaming reads without loading entire files into memory
@@ -121,7 +121,7 @@ Comparison with other popular Go dBase libraries:
 
 ### Technical Advantages
 
-**🔒 Concurrent Safety**: Built-in mutex locks ensure safe operations in multi-threaded environments.
+**🔒 Concurrent Safety**: Public read/write entry points (`Row`, `Next`, `Rows`, `Search`, `ReadRow`, `ReadMemo`, `WriteRow`, `WriteMemo`, `Skip`, `Close`, ...) are synchronized with an RWMutex, and FPT block allocation has a dedicated mutex. The raw construction primitives (`Init`, `WriteHeader`, `WriteColumns`, ...) are intentionally unprotected because they run during table creation or from already locked paths; do not call them concurrently. See [docs/architecture.md](docs/architecture.md).
 
 **⚡ Memory Efficiency**: Streaming approach reads only required file positions instead of loading entire files into memory, enabling processing of large files with minimal RAM usage.
 
@@ -398,6 +398,37 @@ if err != nil {
     }
 }
 ```
+
+Structural failures are distinguishable with `errors.Is`:
+
+```go
+switch {
+case errors.Is(err, dbase.ErrRowTruncated):      // record shorter than header RowLength
+case errors.Is(err, dbase.ErrTableTruncated):    // file ends before declared RowsCount
+case errors.Is(err, dbase.ErrInvalidMarker):     // record marker is not 0x20/0x2A
+case errors.Is(err, dbase.ErrInvalidEncoding):   // code page decode failed
+case errors.Is(err, dbase.ErrMemoFree):          // memo pointer into unwritten space
+case errors.Is(err, dbase.ErrMemoOutOfBounds):   // memo pointer beyond FPT / inside header
+case errors.Is(err, dbase.ErrClosed):            // entry point used after Close
+}
+```
+
+See [docs/diagnostics.md](docs/diagnostics.md) for the full taxonomy.
+
+### Deletion semantics
+
+Deleting a row writes `0x2A` into the record marker byte only. The row stays
+on disk, is still counted in the header, and its memo blocks are not reclaimed.
+This library currently has **no PACK operation** — physical removal is not
+implemented; use `Deleted()` or `Rows(skipInvalid, skipDeleted=true)` to skip
+flagged records. The full memory/DBF/FPT state changes for every operation are
+mapped in [docs/record-lifecycle.md](docs/record-lifecycle.md).
+
+### Reference documentation
+
+- [Record lifecycle map](docs/record-lifecycle.md) — memory vs DBF bytes vs FPT blocks for open/seek/read/write/delete/close, complexity and failure boundaries
+- [Architecture and concurrency boundary](docs/architecture.md) — ownership and exact lock ranges along Table, Header, Interpreter, EncodingConverter, bytes reader and Unix/Windows IO
+- [Diagnostic error reference](docs/diagnostics.md) — sentinel errors, deletion vs physical removal, recoverability
 
 ### Working with Large Files
 
