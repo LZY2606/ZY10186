@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // BytesReadWriteSeeker wraps a byte slice to implement io.ReadWriteSeeker.
 // This allows byte data to be used with GenericIO for reading dBase files from memory.
 type BytesReadWriteSeeker struct {
+	mu     sync.Mutex
 	data   []byte
 	reader *bytes.Reader
 	pos    int64
@@ -34,6 +36,8 @@ func NewBytesReadWriteSeeker(data []byte) *BytesReadWriteSeeker {
 
 // Read implements io.Reader.
 func (b *BytesReadWriteSeeker) Read(p []byte) (n int, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.reader == nil {
 		return 0, io.EOF
 	}
@@ -47,14 +51,19 @@ func (b *BytesReadWriteSeeker) Read(p []byte) (n int, err error) {
 // Note: For dBase file reading, write operations are typically not needed,
 // but this implementation allows the interface to be satisfied.
 func (b *BytesReadWriteSeeker) Write(p []byte) (n int, err error) {
-	if b.pos < 0 || b.pos > int64(len(b.data)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pos < 0 {
 		return 0, fmt.Errorf("invalid seek position: %d", b.pos)
 	}
 
-	// If writing beyond current data, extend the slice
+	// Writing beyond the current end extends the buffer, matching os.File
+	// semantics: the gap between the old end and the write offset is filled
+	// with zero bytes (a sparse write). This is required when creating a table
+	// in memory, because the column descriptors start at offset 32 while the
+	// header is only 30 bytes long.
 	endPos := b.pos + int64(len(p))
 	if endPos > int64(len(b.data)) {
-		// Extend the data slice
 		newData := make([]byte, endPos)
 		copy(newData, b.data)
 		b.data = newData
@@ -73,6 +82,8 @@ func (b *BytesReadWriteSeeker) Write(p []byte) (n int, err error) {
 
 // Seek implements io.Seeker.
 func (b *BytesReadWriteSeeker) Seek(offset int64, whence int) (int64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.reader == nil {
 		return 0, fmt.Errorf("reader is nil")
 	}
@@ -105,11 +116,15 @@ func (b *BytesReadWriteSeeker) Close() error {
 
 // Size returns the current size of the underlying data.
 func (b *BytesReadWriteSeeker) Size() int64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return int64(len(b.data))
 }
 
 // Data returns a copy of the underlying data.
 func (b *BytesReadWriteSeeker) Data() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	result := make([]byte, len(b.data))
 	copy(result, b.data)
 	return result

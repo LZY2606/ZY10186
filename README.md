@@ -11,6 +11,11 @@
 
 ## Overview
 
+> Internal documentation: see [`docs/record-lifecycle.md`](docs/record-lifecycle.md)
+> for the executable record lifecycle map and
+> [`docs/architecture.md`](docs/architecture.md) for ownership, locking and
+> diagnostic guarantees.
+
 This package provides comprehensive tools for working with dBase-format database files (.DBF) and their associated memo files (.FPT). It offers cross-platform compatibility with optimized I/O operations for both Unix and Windows systems, flexible data representation, and safe concurrent operations.
 
 ### Key Features

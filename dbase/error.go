@@ -23,7 +23,33 @@ var (
 	ErrInvalidEncoding = errors.New("INVALID_ENCODING")
 	// ErrUnknownDataType is returned when an invalid data type is used
 	ErrUnknownDataType = errors.New("UNKNOWN_DATA_TYPE")
+	// ErrClosed is returned when an entry point is used after Close.
+	ErrClosed = errors.New("TABLE_CLOSED")
+	// ErrInvalidDeleteFlag is returned when a record does not start with the
+	// active (0x20) or deleted (0x2A) marker.
+	ErrInvalidDeleteFlag = errors.New("INVALID_DELETE_FLAG")
+	// ErrTruncatedRecord is returned when a record is shorter than RowLength.
+	ErrTruncatedRecord = errors.New("TRUNCATED_RECORD")
+	// ErrRecordCountMismatch is returned when the header declares more records
+	// than the physical DBF file contains.
+	ErrRecordCountMismatch = errors.New("RECORD_COUNT_MISMATCH")
+	// ErrMemoFreeBlock is returned when a memo pointer references the reserved
+	// header region or a free block instead of a data block.
+	ErrMemoFreeBlock = errors.New("MEMO_FREE_BLOCK")
+	// ErrMemoOutOfBounds is returned when a memo pointer references a block
+	// beyond the physical end of the FPT file.
+	ErrMemoOutOfBounds = errors.New("MEMO_OUT_OF_BOUNDS")
 )
+
+// Unwrap reports all wrapped detail errors so errors.Is and errors.As traverse
+// both encoding/conversion failures and the diagnostic sentinels attached via
+// Details.
+func (e Error) Unwrap() []error {
+	if len(e.details) == 0 {
+		return nil
+	}
+	return e.details
+}
 
 // Error is a wrapper for errors that occur in the dbase package
 type Error struct {
@@ -93,7 +119,7 @@ func WrapError(err error) Error {
 	e := Error{
 		msg:     err.Error(),
 		trace:   make([]string, 0),
-		details: make([]error, 0),
+		details: []error{err},
 	}
 	e.trace = traceError(e)
 	return e

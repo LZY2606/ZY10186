@@ -21,40 +21,77 @@ type File struct {
 	table          *Table      // Containing the columns and internal row pointer.
 	nullFlagColumn *Column     // The column containing the null flag column (if varchar or varbinary field exists).
 	isNew          bool
+	opMu           sync.RWMutex // Lifecycle lock: guards handles, header/cursor state and Close.
+	closed         bool         // True once Close completed; further entry points fail with ErrClosed.
 }
 
 // TableName returns the name of the dBase table.
 func (file *File) TableName() string {
+	end, _ := file.beginRead()
+	if end == nil {
+		return ""
+	}
+	defer end()
 	return file.table.name
 }
 
 // EOF returns true if the internal row pointer is at the end of file.
 func (file *File) EOF() bool {
+	end, _ := file.beginRead()
+	if end == nil {
+		return true
+	}
+	defer end()
 	return file.table.rowPointer >= file.header.RowsCount
 }
 
 // BOF returns true if the internal row pointer is before the first row.
 func (file *File) BOF() bool {
+	end, _ := file.beginRead()
+	if end == nil {
+		return false
+	}
+	defer end()
 	return file.table.rowPointer == 0
 }
 
 // Pointer returns the current row pointer position.
 func (file *File) Pointer() uint32 {
+	end, _ := file.beginRead()
+	if end == nil {
+		return 0
+	}
+	defer end()
 	return file.table.rowPointer
 }
 
 // Header returns the dBase file header struct for inspection.
 func (file *File) Header() *Header {
+	end, _ := file.beginRead()
+	if end == nil {
+		return nil
+	}
+	defer end()
 	return file.header
 }
 
 // RowsCount returns the number of rows in the dBase file.
 func (file *File) RowsCount() uint32 {
+	end, _ := file.beginRead()
+	if end == nil {
+		return 0
+	}
+	defer end()
 	return file.header.RowsCount
 }
 
 // Columns returns all columns in the dBase table.
 func (file *File) Columns() []*Column {
+	end, _ := file.beginRead()
+	if end == nil {
+		return nil
+	}
+	defer end()
 	return file.table.columns
 }
 
@@ -115,7 +152,12 @@ func (file *File) SetColumnModification(position int, mod *Modification) {
 // SetColumnModificationByName sets a modification for the column with the specified name.
 // Returns an error if the column is not found.
 func (file *File) SetColumnModificationByName(name string, mod *Modification) error {
-	position := file.ColumnPosByName(name)
+	end, err := file.beginWrite()
+	if err != nil {
+		return WrapError(err)
+	}
+	defer end()
+	position := file.columnPosByNameLocked(name)
 	if position < 0 {
 		return NewErrorf("Column '%s' not found", name)
 	}
@@ -125,7 +167,25 @@ func (file *File) SetColumnModificationByName(name string, mod *Modification) er
 
 // GetColumnModification returns the column modification for the column at the specified position.
 func (file *File) GetColumnModification(position int) *Modification {
+	end, _ := file.beginRead()
+	if end == nil {
+		return nil
+	}
+	defer end()
+	if position < 0 || position >= len(file.table.mods) {
+		return nil
+	}
 	return file.table.mods[position]
+}
+
+// columnPosByNameLocked looks up a column position while the lifecycle lock is held.
+func (file *File) columnPosByNameLocked(colname string) int {
+	for i := 0; i < len(file.table.columns); i++ {
+		if file.table.columns[i].Name() == colname {
+			return i
+		}
+	}
+	return -1
 }
 
 // Init creates the dBase files and writes the header and columns to them.
@@ -156,15 +216,22 @@ func (file *File) Init() error {
 // If skipInvalid is true, invalid rows are skipped instead of returning an error.
 // If skipDeleted is true, deleted rows are excluded from the result.
 func (file *File) Rows(skipInvalid bool, skipDeleted bool) ([]*Row, error) {
+	end, err := file.beginWrite()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
 	rows := make([]*Row, 0)
-	for !file.EOF() {
-		row, err := file.Next()
+	for file.table.rowPointer < file.header.RowsCount {
+		row, err := file.rowLocked()
 		if err != nil {
 			if skipInvalid {
+				file.table.rowPointer = clampPointer(file.table.rowPointer, 1, file.header.RowsCount)
 				continue
 			}
 			return nil, WrapError(err)
 		}
+		file.table.rowPointer = clampPointer(file.table.rowPointer, 1, file.header.RowsCount)
 
 		// skip deleted rows
 		if row.Deleted && skipDeleted {
@@ -177,26 +244,72 @@ func (file *File) Rows(skipInvalid bool, skipDeleted bool) ([]*Row, error) {
 
 // Next reads the current row and increments the row pointer by one.
 func (file *File) Next() (*Row, error) {
-	row, err := file.Row()
-	file.Skip(1)
+	end, err := file.beginWrite()
 	if err != nil {
 		return nil, WrapError(err)
 	}
-	return row, err
+	defer end()
+	row, err := file.rowLocked()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	file.table.rowPointer = clampPointer(file.table.rowPointer, 1, file.header.RowsCount)
+	return row, nil
 }
 
 // Row returns the row at the current file row pointer position.
 func (file *File) Row() (*Row, error) {
-	data, err := file.ReadRow(file.table.rowPointer)
+	// The row pointer is shared cursor state, so cursor based reads take the
+	// write lock just like Next. Goroutines that need to read concurrently must
+	// use ReadRowAt with an explicit position.
+	end, err := file.beginWrite()
 	if err != nil {
 		return nil, WrapError(err)
 	}
-	return file.BytesToRow(data)
+	defer end()
+	return file.rowLocked()
+}
+
+// rowLocked reads the row at the current cursor while the lifecycle lock is
+// already held by the caller.
+func (file *File) rowLocked() (*Row, error) {
+	data, err := file.io.ReadRow(file, file.table.rowPointer)
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	return file.bytesToRowLocked(data)
+}
+
+// ReadRowAt reads one record at an explicit, zero based position without
+// touching the shared row pointer. It is safe to call concurrently from
+// multiple goroutines and from read-only tables.
+func (file *File) ReadRowAt(position uint32) (*Row, error) {
+	end, err := file.beginRead()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
+	data, err := file.io.ReadRow(file, position)
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	return file.bytesToRowLocked(data)
 }
 
 // NewRow creates a new Row struct with the same column structure as the dBase file.
 // The row is positioned at the next available row position.
 func (file *File) NewRow() *Row {
+	end, _ := file.beginRead()
+	if end == nil {
+		return nil
+	}
+	defer end()
+	return file.newRowLocked()
+}
+
+// newRowLocked builds an empty row at the next append position while the
+// lifecycle lock is held.
+func (file *File) newRowLocked() *Row {
 	row := &Row{
 		handle:   file,
 		Position: file.header.RowsCount + 1,
@@ -216,7 +329,12 @@ func (file *File) NewRow() *Row {
 // NewField creates a new field with the specified value and column at the given position.
 // Returns an error if the column position is invalid.
 func (file *File) NewField(pos int, value interface{}) (*Field, error) {
-	column := file.Column(pos)
+	end, _ := file.beginRead()
+	if end == nil {
+		return nil, WrapError(ErrClosed)
+	}
+	defer end()
+	column := file.columnLocked(pos)
 	if column == nil {
 		return nil, NewErrorf("column at position %v not found", pos)
 	}
@@ -226,7 +344,12 @@ func (file *File) NewField(pos int, value interface{}) (*Field, error) {
 // NewFieldByName creates a new field with the specified value and column identified by name.
 // Returns an error if the column is not found.
 func (file *File) NewFieldByName(name string, value interface{}) (*Field, error) {
-	pos := file.ColumnPosByName(name)
+	end, _ := file.beginRead()
+	if end == nil {
+		return nil, WrapError(ErrClosed)
+	}
+	defer end()
+	pos := file.columnPosByNameLocked(name)
 	if pos < 0 {
 		return nil, NewErrorf("column '%s' not found", name)
 	}
@@ -236,25 +359,40 @@ func (file *File) NewFieldByName(name string, value interface{}) (*Field, error)
 // BytesToRow converts raw row data to a Row struct.
 // If the data references a memo (FPT) file, that file is also read.
 func (file *File) BytesToRow(data []byte) (*Row, error) {
+	end, err := file.beginRead()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
+	return file.bytesToRowLocked(data)
+}
+
+// bytesToRowLocked converts raw row bytes while the lifecycle lock is held.
+// Varchar/varbinary null flags are read through the cursor independent IO
+// helpers and therefore only work for the pointer based callers; all other
+// column types are decoded purely from data.
+func (file *File) bytesToRowLocked(data []byte) (*Row, error) {
 	debugf("Converting row data (%d bytes) to row struct...", len(data))
 	rec := &Row{}
 	rec.Position = file.table.rowPointer
 	rec.handle = file
 	rec.fields = make([]*Field, 0)
 	if len(data) < int(file.header.RowLength) {
-		return nil, NewErrorf("invalid row data size %v Bytes < %v Bytes", len(data), int(file.header.RowLength))
+		return nil, NewErrorf("truncated record at position %d: %d bytes < %d bytes",
+			rec.Position, len(data), int(file.header.RowLength)).Details(ErrTruncatedRecord)
 	}
 	// a row should start with te delete flag, a space ACTIVE(0x20) or DELETED(0x2A)
 	rec.Deleted = Marker(data[0]) == Deleted
 	if !rec.Deleted && Marker(data[0]) != Active {
-		return nil, NewError("invalid row data, no delete flag found at beginning of row")
+		return nil, NewErrorf("invalid delete flag 0x%02x at record %d: expected 0x20 (active) or 0x2a (deleted)",
+			data[0], rec.Position).Details(ErrInvalidDeleteFlag)
 	}
 	// deleted flag already read
 	offset := uint16(1)
 	for i := 0; i < int(file.ColumnsCount()); i++ {
 		column := file.table.columns[i]
 		raw := data[offset : offset+uint16(column.Length)]
-		val, err := file.Interpret(raw, file.table.columns[i])
+		val, err := file.interpretLocked(raw, file.table.columns[i], rec.Position)
 		if err != nil {
 			return nil, WrapError(err)
 		}
@@ -289,8 +427,19 @@ func (file *File) BytesToRow(data []byte) (*Row, error) {
 
 // Converts a map of interfaces into the row representation
 func (file *File) RowFromMap(m map[string]interface{}) (*Row, error) {
+	// Building the row may run autoincrement, which rewrites the column
+	// descriptors, so it takes the write lock.
+	end, err := file.beginWrite()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
+	return file.rowFromMapLocked(m)
+}
+
+func (file *File) rowFromMapLocked(m map[string]interface{}) (*Row, error) {
 	debugf("Converting map to row... \n%+v", m)
-	row := file.NewRow()
+	row := file.newRowLocked()
 	for i := range row.fields {
 		field := &Field{column: file.table.columns[i]}
 		if val, ok := m[field.Name()]; ok {
@@ -319,8 +468,7 @@ func (file *File) RowFromMap(m map[string]interface{}) (*Row, error) {
 
 		row.fields[i] = field
 	}
-	err := row.Increment()
-	if err != nil {
+	if err := row.incrementLocked(); err != nil {
 		return nil, WrapError(err)
 	}
 	return row, nil
@@ -328,13 +476,18 @@ func (file *File) RowFromMap(m map[string]interface{}) (*Row, error) {
 
 // Converts a JSON-encoded row into the row representation
 func (file *File) RowFromJSON(j []byte) (*Row, error) {
+	end, err := file.beginWrite()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
 	debugf("Converting JSON to row...")
 	m := make(map[string]interface{})
-	err := json.Unmarshal(j, &m)
+	err = json.Unmarshal(j, &m)
 	if err != nil {
 		return nil, NewError("unable to unmarshal JSON").Details(err)
 	}
-	row, err := file.RowFromMap(m)
+	row, err := file.rowFromMapLocked(m)
 	if err != nil {
 		return nil, WrapError(err)
 	}
@@ -363,9 +516,17 @@ func (file *File) RowFromStruct(v interface{}) (*Row, error) {
 		}
 		m[tag] = rv.Field(i).Interface()
 	}
-	row, err := file.RowFromMap(m)
+	row, err := file.rowFromMapLocked(m)
 	if err != nil {
 		return nil, WrapError(err)
 	}
 	return row, nil
+}
+
+// columnLocked returns the column at pos while the lifecycle lock is held.
+func (file *File) columnLocked(pos int) *Column {
+	if pos < 0 || pos >= len(file.table.columns) {
+		return nil
+	}
+	return file.table.columns[pos]
 }

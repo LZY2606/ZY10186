@@ -35,6 +35,21 @@ import (
 //
 // Not all available column types have been implemented because we don't use them in our DBFs
 func (file *File) Interpret(raw []byte, column *Column) (interface{}, error) {
+	end, err := file.beginRead()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
+	var position uint32
+	if file.table != nil {
+		position = file.table.rowPointer
+	}
+	return file.interpretLocked(raw, column, position)
+}
+
+// interpretLocked decodes one column while the lifecycle lock is held.
+// position is the record position used for varchar/varbinary null flag reads.
+func (file *File) interpretLocked(raw []byte, column *Column, position uint32) (interface{}, error) {
 	if len(raw) != int(column.Length) {
 		return nil, NewErrorf("invalid length %v Bytes != %v Bytes at column field: %v", len(raw), column.Length, column.Name())
 	}
@@ -45,7 +60,7 @@ func (file *File) Interpret(raw []byte, column *Column) (interface{}, error) {
 	switch DataType(column.DataType) {
 	// M values contain the address in the FPT file from where to read data
 	case Memo:
-		return file.parseMemo(raw, column)
+		return file.parseMemo(raw, column, position)
 	// C values are stored as strings, the returned string is not trimmed
 	case Character:
 		return file.parseCharacter(raw, column)
@@ -77,9 +92,9 @@ func (file *File) Interpret(raw []byte, column *Column) (interface{}, error) {
 		return file.parseNumeric(raw, column)
 	// V and Q values just return the raw value
 	case Varchar:
-		return file.parseVarchar(raw, column)
+		return file.parseVarchar(raw, column, position)
 	case Varbinary:
-		return file.parseVarbinary(raw, column)
+		return file.parseVarbinary(raw, column, position)
 	// W, P and G values just return the raw value
 	case Blob, Picture, General:
 		return file.parseRaw(raw, column)
@@ -91,6 +106,18 @@ func (file *File) Interpret(raw []byte, column *Column) (interface{}, error) {
 // Represent converts column data to the byte representation of the columns data type
 // For M values the data is written to the memo file and the address is returned
 func (file *File) Represent(field *Field, padding bool) ([]byte, error) {
+	end, err := file.beginWrite()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
+	return file.representLocked(field, padding)
+}
+
+// representLocked converts a field to its raw representation while the
+// lifecycle lock is held. Memo values allocate FPT blocks, hence the write
+// lock is required even when called from a read entry.
+func (file *File) representLocked(field *Field, padding bool) ([]byte, error) {
 	if field.GetValue() == nil {
 		return make([]byte, field.column.Length), nil
 	}
@@ -144,12 +171,13 @@ func (file *File) Represent(field *Field, padding bool) ([]byte, error) {
 }
 
 // Returns the value from the memo file as string or []byte
-func (file *File) parseMemo(raw []byte, column *Column) (interface{}, error) {
+func (file *File) parseMemo(raw []byte, column *Column, position uint32) (interface{}, error) {
+	_ = position
 	// M values contain the address in the FPT file from where to read data
 	if isEmptyBytes(raw) {
 		return []byte{}, nil
 	}
-	memo, isText, err := file.ReadMemo(raw, column)
+	memo, isText, err := file.readMemoLocked(raw, column)
 	if err != nil {
 		return nil, NewErrorf("parsing memo failed at column field: %v failed", column.Name()).Details(err)
 	}
@@ -184,7 +212,7 @@ func (file *File) getMemoRepresentation(field *Field, _ bool) ([]byte, error) {
 	if !ok && !sok {
 		return nil, NewErrorf("invalid type for memo field: %T", field.value)
 	}
-	address, err := file.WriteMemo(field.memoPos, memo, txt, len(memo))
+	address, err := file.writeMemoLocked(field.memoPos, memo, txt, len(memo))
 	if err != nil {
 		return nil, WrapError(err)
 	}
@@ -202,7 +230,7 @@ func (file *File) parseCharacter(raw []byte, column *Column) (interface{}, error
 	// C values are stored as strings, the returned string is not trimmed
 	str, err := toUTF8String(raw, file.config.Converter)
 	if err != nil {
-		return str, NewErrorf("parsing to utf8 string failed at column field: %v failed", column.Name()).Details(err)
+		return str, NewErrorf("decoding character field %v with code page 0x%02x failed", column.Name(), file.config.Converter.CodePage()).Details(fmt.Errorf("%w: %v", ErrInvalidEncoding, err))
 	}
 	return str, nil
 }
@@ -542,12 +570,12 @@ func (file *File) getNumericRepresentation(field *Field, skipSpacing bool) ([]by
 	return prependSpaces(bin, int(field.column.Length)), nil
 }
 
-func (file *File) parseVarchar(raw []byte, column *Column) (interface{}, error) {
-	varlen, null, err := file.ReadNullFlag(uint64(file.table.rowPointer), column)
+func (file *File) parseVarchar(raw []byte, column *Column, position uint32) (interface{}, error) {
+	varlen, isNull, err := file.readNullFlagLocked(uint64(position), column)
 	if err != nil {
 		return nil, NewErrorf("reading null flag at column field: %v failed", column.Name()).Details(err)
 	}
-	if null {
+	if isNull {
 		return []byte{}, nil
 	}
 	if varlen {
@@ -569,12 +597,12 @@ func (file *File) getVarcharRepresentation(field *Field, _ bool) ([]byte, error)
 	return nil, NewErrorf("invalid data type %T, expected string at column field: %v", field.value, field.Name())
 }
 
-func (file *File) parseVarbinary(raw []byte, column *Column) (interface{}, error) {
-	varlen, null, err := file.ReadNullFlag(uint64(file.table.rowPointer), column)
+func (file *File) parseVarbinary(raw []byte, column *Column, position uint32) (interface{}, error) {
+	varlen, isNull, err := file.readNullFlagLocked(uint64(position), column)
 	if err != nil {
 		return nil, NewErrorf("reading null flag at column field: %v failed", column.Name()).Details(err)
 	}
-	if null {
+	if isNull {
 		return []byte{}, nil
 	}
 	if varlen {

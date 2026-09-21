@@ -85,7 +85,12 @@ func (row *Row) Value(pos int) interface{} {
 // ValueByName returns the value of a row for the column with the specified name.
 // Returns an error if the column is not found.
 func (row *Row) ValueByName(name string) (interface{}, error) {
-	pos := row.handle.ColumnPosByName(name)
+	end, err := row.handle.beginRead()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
+	pos := row.handle.columnPosByNameLocked(name)
 	if pos < 0 {
 		return nil, NewErrorf("column %v not found", name)
 	}
@@ -297,11 +302,26 @@ func (row *Row) Field(pos int) *Field {
 
 // Returns the field of a row by name or nil if not found
 func (row *Row) FieldByName(name string) *Field {
-	return row.Field(row.handle.ColumnPosByName(name))
+	end, _ := row.handle.beginRead()
+	if end == nil {
+		return nil
+	}
+	defer end()
+	return row.Field(row.handle.columnPosByNameLocked(name))
 }
 
 // Converts the row back to raw dbase data
 func (row *Row) ToBytes() ([]byte, error) {
+	end, err := row.handle.beginWrite()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
+	return row.toBytesLocked()
+}
+
+// toBytesLocked serializes a row while the lifecycle lock is held.
+func (row *Row) toBytesLocked() ([]byte, error) {
 	debugf("Converting row %v to row data (%d bytes)...", row.Position, row.handle.header.RowLength)
 	data := make([]byte, row.handle.header.RowLength)
 	// a row should start with te delete flag, a space ACTIVE(0x20) or DELETED(0x2A)
@@ -315,7 +335,7 @@ func (row *Row) ToBytes() ([]byte, error) {
 	varPos := 0
 	nullFlag := make([]byte, 1)
 	for _, field := range row.fields {
-		val, err := row.handle.Represent(field, false)
+		val, err := row.handle.representLocked(field, false)
 		if err != nil {
 			return nil, WrapError(err)
 		}
@@ -360,9 +380,13 @@ func (row *Row) ToBytes() ([]byte, error) {
 
 // Returns a complete row as a map.
 func (row *Row) ToMap() (map[string]interface{}, error) {
+	end, err := row.handle.beginRead()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
 	debugf("Converting row %v to map...", row.Position)
 	out := make(map[string]interface{})
-	var err error
 	for i, field := range row.fields {
 		val := field.GetValue()
 		if i >= 0 && i < len(row.handle.table.mods) && row.handle.table.mods[i] != nil {
@@ -593,12 +617,20 @@ func NewTable(version FileVersion, config *Config, columns []*Column, memoBlockS
 	}
 	// If there are memo fields, add the memo header
 	if memoField {
-		file.memoHeader = &MemoHeader{
-			NextFree:  0,
-			Unused:    [2]byte{0x00, 0x00},
-			BlockSize: memoBlockSize,
+		// FoxPro FPT files use 64 byte data blocks; the first 512 bytes are
+		// always reserved for the file header so the first data block is
+		// block 8 (NextFree). A block size of 0 selects that default. dBase IV
+		// style files pass 512, which keeps the first data block at block 1.
+		blockSize := memoBlockSize
+		if blockSize == 0 {
+			blockSize = defaultMemoBlockSize
 		}
-		debugf("Initializing related memo file header - block size: %v", file.memoHeader.BlockSize)
+		file.memoHeader = &MemoHeader{
+			NextFree:  memoHeaderBlocks(blockSize),
+			Unused:    [2]byte{0x00, 0x00},
+			BlockSize: blockSize,
+		}
+		debugf("Initializing related memo file header - block size: %v - first data block: %v", file.memoHeader.BlockSize, file.memoHeader.NextFree)
 	}
 	// If there are nullable or variable length fields, add the null flag column
 	if nullFlagLength > 0 {
@@ -696,6 +728,17 @@ func (row *Row) Write() error {
 // Also increases the Next value by the amount of Step
 // Rewrites the columns header
 func (row *Row) Increment() error {
+	end, err := row.handle.beginWrite()
+	if err != nil {
+		return WrapError(err)
+	}
+	defer end()
+	return row.incrementLocked()
+}
+
+// incrementLocked applies autoincrement values and rewrites the column
+// descriptors while the lifecycle lock is held.
+func (row *Row) incrementLocked() error {
 	for _, field := range row.fields {
 		if field.column.Flag.Has(byte(AutoincrementFlag)) {
 			field.value = int32(field.column.Next)
@@ -703,8 +746,7 @@ func (row *Row) Increment() error {
 			debugf("Incrementing autoincrement field %s to %v (Step: %v)", field.column.Name(), field.value, field.column.Step)
 		}
 	}
-	err := row.handle.WriteColumns()
-	if err != nil {
+	if err := row.handle.io.WriteColumns(row.handle); err != nil {
 		return WrapError(err)
 	}
 	return nil

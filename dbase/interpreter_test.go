@@ -558,7 +558,7 @@ func TestFile_parseMemo(t *testing.T) {
 
 	// Test with empty bytes (should return empty byte slice)
 	raw := []byte{}
-	result, err := file.parseMemo(raw, column)
+	result, err := file.parseMemo(raw, column, 0)
 	if err != nil {
 		t.Errorf("Unexpected error with empty bytes: %v", err)
 	}
@@ -569,7 +569,7 @@ func TestFile_parseMemo(t *testing.T) {
 
 	// Test with all zeros (also empty)
 	raw = []byte{0x00, 0x00, 0x00, 0x00}
-	result, err = file.parseMemo(raw, column)
+	result, err = file.parseMemo(raw, column, 0)
 	if err != nil {
 		t.Errorf("Unexpected error with zero bytes: %v", err)
 	}

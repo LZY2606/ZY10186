@@ -179,4 +179,8 @@ const (
 	MaxCompactIndexKeyLength = 240
 	// NumericPrecisionDigits is the number of precision digits for numeric calculations (16)
 	NumericPrecisionDigits = 16
+	// defaultMemoBlockSize is the FoxPro FPT block size used when NewTable is
+	// called with a memo block size of 0. The FPT header always occupies 512
+	// bytes, so data starts at block 512/64 = 8.
+	defaultMemoBlockSize uint16 = 64
 )

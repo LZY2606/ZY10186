@@ -90,87 +90,180 @@ func OpenTable(config *Config) (*File, error) {
 
 // Close closes all file handlers for the dBase file and its associated memo file.
 func (file *File) Close() error {
-	return file.defaults().io.Close(file)
+	end, err := file.beginClose()
+	if err != nil {
+		return WrapError(err)
+	}
+	closeErr := file.io.Close(file)
+	end()
+	if closeErr != nil {
+		// A failed close leaves the handle state unknown; keep closed=true so
+		// callers do not keep using a half closed file and return the error.
+		return WrapError(closeErr)
+	}
+	return nil
 }
 
 // Create creates a new dBase database file (and the memo file if needed).
 func (file *File) Create() error {
+	// Create is part of NewTable/Init before the file is published; it does
+	// not take the lifecycle lock.
 	file.isNew = true
 	return file.defaults().io.Create(file)
 }
 
 // ReadHeader reads the dBase file header from the file handle.
 func (file *File) ReadHeader() error {
-	return file.defaults().io.ReadHeader(file)
+	end, err := file.beginRead()
+	if err != nil {
+		return WrapError(err)
+	}
+	defer end()
+	return file.io.ReadHeader(file)
 }
 
 // WriteHeader writes the header to the dBase file.
 func (file *File) WriteHeader() error {
-	return file.defaults().io.WriteHeader(file)
+	end, err := file.beginWrite()
+	if err != nil {
+		return WrapError(err)
+	}
+	defer end()
+	return file.io.WriteHeader(file)
 }
 
 // ReadColumns reads column definitions from the dBase file header, starting at position 32,
 // until it finds the header row terminator END_OF_COLUMN (0x0D).
 func (file *File) ReadColumns() ([]*Column, *Column, error) {
-	return file.defaults().io.ReadColumns(file)
+	end, err := file.beginRead()
+	if err != nil {
+		return nil, nil, WrapError(err)
+	}
+	defer end()
+	return file.io.ReadColumns(file)
 }
 
 // WriteColumns writes the column definitions to the end of the header in the dBase file.
 func (file *File) WriteColumns() error {
-	return file.defaults().io.WriteColumns(file)
+	end, err := file.beginWrite()
+	if err != nil {
+		return WrapError(err)
+	}
+	defer end()
+	return file.io.WriteColumns(file)
 }
 
 // ReadMemoHeader reads the memo file header from the given file handle.
 func (file *File) ReadMemoHeader() error {
-	return file.defaults().io.ReadMemoHeader(file)
+	end, err := file.beginRead()
+	if err != nil {
+		return WrapError(err)
+	}
+	defer end()
+	return file.io.ReadMemoHeader(file)
 }
 
 // WriteMemoHeader writes the memo header to the memo file.
 // The size parameter specifies the number of blocks the new memo data will occupy.
 func (file *File) WriteMemoHeader(size int) error {
-	return file.defaults().io.WriteMemoHeader(file, size)
+	end, err := file.beginWrite()
+	if err != nil {
+		return WrapError(err)
+	}
+	defer end()
+	return file.io.WriteMemoHeader(file, size)
 }
 
 // ReadRow reads the raw row data of one row at the specified row position.
 func (file *File) ReadRow(position uint32) ([]byte, error) {
-	return file.defaults().io.ReadRow(file, position)
+	end, err := file.beginRead()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
+	return file.io.ReadRow(file, position)
 }
 
 // WriteRow writes the raw row data to the specified row position in the dBase file.
 func (file *File) WriteRow(row *Row) error {
-	return file.defaults().io.WriteRow(file, row)
+	end, err := file.beginWrite()
+	if err != nil {
+		return WrapError(err)
+	}
+	defer end()
+	return file.io.WriteRow(file, row)
 }
 
 // ReadMemo reads one or more blocks from the memo file for the specified memo column.
 // Returns the raw data and a boolean indicating if the data is text (true) or binary (false).
 func (file *File) ReadMemo(address []byte, column *Column) ([]byte, bool, error) {
-	return file.defaults().io.ReadMemo(file, address, column)
+	end, err := file.beginRead()
+	if err != nil {
+		return nil, false, WrapError(err)
+	}
+	defer end()
+	return file.readMemoLocked(address, column)
+}
+
+// readMemoLocked reads a memo block while the lifecycle lock is already held.
+func (file *File) readMemoLocked(address []byte, column *Column) ([]byte, bool, error) {
+	return file.io.ReadMemo(file, address, column)
 }
 
 // WriteMemo writes memo data to the memo file and returns the address of the memo.
 // The text parameter indicates whether the data is text (true) or binary (false).
 // The length parameter specifies the length of the data to write.
 func (file *File) WriteMemo(address []byte, data []byte, text bool, length int) ([]byte, error) {
-	return file.defaults().io.WriteMemo(address, file, data, text, length)
+	end, err := file.beginWrite()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
+	return file.writeMemoLocked(address, data, text, length)
+}
+
+// writeMemoLocked writes a memo block while the lifecycle lock is held.
+func (file *File) writeMemoLocked(address []byte, data []byte, text bool, length int) ([]byte, error) {
+	return file.io.WriteMemo(address, file, data, text, length)
 }
 
 // ReadNullFlag reads the null flag field at the end of the row.
 // The null flag field indicates if the field has a variable length.
 // Returns true as the first value if the field is variable length, and true as the second value if the field is null.
 func (file *File) ReadNullFlag(position uint64, column *Column) (bool, bool, error) {
-	return file.defaults().io.ReadNullFlag(file, position, column)
+	end, err := file.beginRead()
+	if err != nil {
+		return false, false, WrapError(err)
+	}
+	defer end()
+	return file.readNullFlagLocked(position, column)
+}
+
+// readNullFlagLocked reads the null flag while the lifecycle lock is held.
+func (file *File) readNullFlagLocked(position uint64, column *Column) (bool, bool, error) {
+	return file.io.ReadNullFlag(file, position, column)
 }
 
 // Search searches for rows that contain the specified value in the given field.
 // If exactMatch is true, only exact matches are returned; otherwise, partial matches are included.
 func (file *File) Search(field *Field, exactMatch bool) ([]*Row, error) {
-	return file.defaults().io.Search(file, field, exactMatch)
+	end, err := file.beginWrite()
+	if err != nil {
+		return nil, WrapError(err)
+	}
+	defer end()
+	return file.io.Search(file, field, exactMatch)
 }
 
 // GoTo sets the internal row pointer to the specified row number.
 // Returns an EOF error if positioning beyond the end of file and positions the pointer at lastRow+1.
 func (file *File) GoTo(row uint32) error {
-	return file.defaults().io.GoTo(file, row)
+	end, err := file.beginWrite()
+	if err != nil {
+		return WrapError(err)
+	}
+	defer end()
+	return file.io.GoTo(file, row)
 }
 
 // Skip adds the specified offset to the internal row pointer.
@@ -178,21 +271,41 @@ func (file *File) GoTo(row uint32) error {
 // If the result would be negative, positions the pointer at 0.
 // Note: This method does not skip deleted rows automatically.
 func (file *File) Skip(offset int64) {
-	file.defaults().io.Skip(file, offset)
+	end, err := file.beginWrite()
+	if err != nil {
+		return
+	}
+	defer end()
+	file.io.Skip(file, offset)
 }
 
 // Deleted returns true if the row at the current internal row pointer position is marked as deleted.
 func (file *File) Deleted() (bool, error) {
-	return file.defaults().io.Deleted(file)
+	end, err := file.beginWrite()
+	if err != nil {
+		return false, WrapError(err)
+	}
+	defer end()
+	return file.io.Deleted(file)
 }
 
 // GetIO returns the IO implementation currently being used by this file.
 func (file *File) GetIO() IO {
+	end, _ := file.beginRead()
+	if end == nil {
+		return nil
+	}
+	defer end()
 	return file.io
 }
 
 // GetHandle returns the file handles being used (dBase file handle, memo file handle).
 func (file *File) GetHandle() (interface{}, interface{}) {
+	end, _ := file.beginRead()
+	if end == nil {
+		return nil, nil
+	}
+	defer end()
 	return file.handle, file.relatedHandle
 }
 

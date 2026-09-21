@@ -334,10 +334,16 @@ func (g GenericIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 	if err != nil {
 		return nil, false, WrapError(err)
 	}
-	// Determine the block number
-	block := binary.LittleEndian.Uint32(address)
-	if block == 0 {
+	if isEmptyBytes(address) {
 		return []byte{}, false, nil
+	}
+	block := binary.LittleEndian.Uint32(address)
+	fptSize, sizeErr := seekSize(relatedHandle)
+	if sizeErr != nil {
+		return nil, false, NewErrorf("failed to determine FPT size").Details(sizeErr)
+	}
+	if err := validateMemoAddress(file.memoHeader, fptSize, address); err != nil {
+		return nil, false, WrapError(err)
 	}
 	position := int64(file.memoHeader.BlockSize) * int64(block)
 	debugf("Reading memo block %d at position %d", block, position)
@@ -373,7 +379,7 @@ func (g GenericIO) ReadMemo(file *File, address []byte, column *Column) ([]byte,
 	if sign == 1 || !column.Flag.Has(byte(BinaryFlag)) {
 		buf, err = file.config.Converter.Decode(buf)
 		if err != nil {
-			return buf, sign == 1, NewErrorf("failed to decode memo data").Details(err)
+			return buf, sign == 1, NewErrorf("failed to decode memo data").Details(fmt.Errorf("%w: %v", ErrInvalidEncoding, err))
 		}
 	}
 	return buf, sign == 1, nil
@@ -390,23 +396,27 @@ func (g GenericIO) WriteMemo(address []byte, file *File, raw []byte, text bool, 
 	if err != nil {
 		return nil, WrapError(err)
 	}
-	// Get the block position
+	// A new memo is appended at NextFree; a non-empty address rewrites the
+	// existing block in place and must not move NextFree.
 	blocks := 1
 	blockPosition := file.memoHeader.NextFree
+	appendNew := isEmptyBytes(address)
 	if length > 0 && file.memoHeader.BlockSize > 0 {
 		blocks = length / int(file.memoHeader.BlockSize)
 		if length%int(file.memoHeader.BlockSize) > 0 {
 			blocks++
 		}
 	}
-	if !isEmptyBytes(address) {
+	if !appendNew {
 		blockPosition = binary.LittleEndian.Uint32(address)
 		blocks = 0
 	}
-	// Write the memo header
-	err = file.WriteMemoHeader(blocks)
-	if err != nil {
-		return nil, WrapError(err)
+	// Write the memo header only when new blocks are allocated.
+	if appendNew {
+		err = file.io.WriteMemoHeader(file, blocks)
+		if err != nil {
+			return nil, WrapError(err)
+		}
 	}
 	// Put the block data together
 	data := make([]byte, 8)
@@ -478,6 +488,13 @@ func (g GenericIO) ReadRow(file *File, position uint32) ([]byte, error) {
 	if position >= file.header.RowsCount {
 		return nil, NewErrorf("position %d > rows count %d", position, file.header.RowsCount)
 	}
+	dbfSize, err := seekSize(handle)
+	if err != nil {
+		return nil, NewErrorf("failed to determine DBF size").Details(err)
+	}
+	if err := validateDbfSize(file.header, dbfSize, position); err != nil {
+		return nil, WrapError(err)
+	}
 	pos := int64(file.header.FirstRow) + (int64(position) * int64(file.header.RowLength))
 	debugf("Reading row: %d at offset: %v", position, pos)
 	buf := make([]byte, file.header.RowLength)
@@ -489,8 +506,8 @@ func (g GenericIO) ReadRow(file *File, position uint32) ([]byte, error) {
 	if err != nil {
 		return buf, NewErrorf("failed to read row data").Details(err)
 	}
-	if read != int(file.header.RowLength) {
-		return buf, NewErrorf("read %d bytes, expected %d", read, file.header.RowLength)
+	if err := validateRowRead(read, int(file.header.RowLength), position); err != nil {
+		return buf, WrapError(err)
 	}
 	return buf, nil
 }
@@ -503,96 +520,56 @@ func (g GenericIO) WriteRow(file *File, row *Row) error {
 	if err != nil {
 		return WrapError(err)
 	}
-	// Convert the row to raw bytes
-	r, err := row.ToBytes()
+	// Convert the row to raw bytes (memo blocks are written here).
+	r, err := row.toBytesLocked()
 	if err != nil {
 		return WrapError(err)
 	}
-	// Update the header
+	// Calculate the record offset first without mutating the header, so a
+	// failed size check leaves both disk and the in-memory count untouched.
+	appending := row.Position >= row.handle.header.RowsCount
 	position := int64(row.handle.header.FirstRow) + (int64(row.Position) * int64(row.handle.header.RowLength))
-	if row.Position >= row.handle.header.RowsCount {
-		// Check if we're exceeding the maximum records per table
+	if appending {
 		if row.handle.header.RowsCount >= MaxRecordsPerTable {
 			return NewErrorf("maximum records per table exceeded: %d >= %d", row.handle.header.RowsCount, MaxRecordsPerTable)
 		}
 		position = int64(row.handle.header.FirstRow) + (int64(row.Position-1) * int64(row.handle.header.RowLength))
+	}
+	debugf("Writing row: %d at offset: %v", row.Position, position)
+	// Write record bytes before committing the header count: a failure here
+	// leaves the previous count valid and the file reopenable.
+	if _, err := handle.Seek(position, 0); err != nil {
+		return NewErrorf("failed to seek to position %d", position).Details(err)
+	}
+	if _, err := handle.Write(r); err != nil {
+		return NewErrorf("failed to write row data").Details(err)
+	}
+	// Commit the in-memory count, validate and write the header last. A header
+	// failure rolls the count back: the orphaned bytes stay readable once the
+	// caller retries with a correct record.
+	if appending {
 		row.handle.header.RowsCount++
-		// Check if the new file size would exceed the maximum
 		if err := row.handle.header.ValidateFileSize(); err != nil {
-			row.handle.header.RowsCount-- // Rollback the increment
+			row.handle.header.RowsCount--
 			return WrapError(err)
 		}
 	}
-	err = row.handle.WriteHeader()
-	if err != nil {
+	if err := row.handle.io.WriteHeader(row.handle); err != nil {
+		if appending {
+			row.handle.header.RowsCount--
+		}
 		return WrapError(err)
-	}
-	debugf("Writing row: %d at offset: %v", row.Position, position)
-	// Seek to the correct position
-	_, err = handle.Seek(position, 0)
-	if err != nil {
-		return NewErrorf("failed to seek to position %d", position).Details(err)
-	}
-	// Write the row
-	_, err = handle.Write(r)
-	if err != nil {
-		return NewErrorf("failed to write row data").Details(err)
 	}
 	return nil
 }
 
 func (g GenericIO) Search(file *File, field *Field, exactMatch bool) ([]*Row, error) {
-	if field.column.DataType == 'M' {
-		return nil, NewError("searching memo fields is not supported")
-	}
-	handle, err := g.getHandle(file)
-	if err != nil {
-		return nil, WrapError(err)
-	}
-	debugf("Searching for value: %v in field: %s", field.GetValue(), field.column.Name())
-	// convert the value to bytes
-	val, err := file.Represent(field, !exactMatch)
-	if err != nil {
-		return nil, WrapError(err)
-	}
-	// Search for the value
-	rows := make([]*Row, 0)
-	position := uint64(file.header.FirstRow)
-	for i := uint32(0); i < file.header.RowsCount; i++ {
-		// Read the field value
-		p := int64(position) + int64(field.column.Position)
-		debugf("Searching at position: %d", p)
-		_, err := handle.Seek(p, 0)
-		position += uint64(file.header.RowLength)
-		if err != nil {
-			continue
-		}
-		buf := make([]byte, field.column.Length)
-		read, err := handle.Read(buf)
-		if err != nil {
-			continue
-		}
-		if read != int(field.column.Length) {
-			continue
-		}
-		// Check if the value matches
-		if bytes.Contains(buf, val) {
-			debugf("Found matching field at position: %d - Record %v position: %v ", p, i+1, p-int64(field.column.Position))
-			err := file.GoTo(i)
-			if err != nil {
-				continue
-			}
-			row, err := file.Row()
-			if err != nil {
-				continue
-			}
-			rows = append(rows, row)
-		}
-	}
-	return rows, nil
+	return searchAt(file, field, exactMatch)
 }
 
 func (g GenericIO) GoTo(file *File, row uint32) error {
+	// row == RowsCount positions at EOF without an error, matching the
+	// documented "returns an EOF error if positioning beyond the end".
 	if row > file.header.RowsCount {
 		file.table.rowPointer = file.header.RowsCount
 		return NewErrorf("%v, go to %v > %v", ErrEOF, row, file.header.RowsCount)
@@ -603,14 +580,7 @@ func (g GenericIO) GoTo(file *File, row uint32) error {
 }
 
 func (g GenericIO) Skip(file *File, offset int64) {
-	newval := int64(file.table.rowPointer) + offset
-	if newval >= int64(file.header.RowsCount) {
-		file.table.rowPointer = file.header.RowsCount
-	}
-	if newval < 0 {
-		file.table.rowPointer = 0
-	}
-	file.table.rowPointer = uint32(newval)
+	file.table.rowPointer = clampPointer(file.table.rowPointer, offset, file.header.RowsCount)
 	debugf("Skipping %d row/s, new position: %d", offset, file.table.rowPointer)
 }
 
@@ -640,25 +610,49 @@ func (g GenericIO) Deleted(file *File) (bool, error) {
 }
 
 func (g GenericIO) getHandle(file *File) (io.ReadWriteSeeker, error) {
-	handle, ok := file.handle.(io.ReadWriteSeeker)
-	if !ok {
-		return nil, NewErrorf("handle is of wrong type %T expected io.ReadWriteSeeker", file.handle)
+	// Prefer the handle carried by this IO value so a File whose IO backend was
+	// replaced (in-memory tests, custom backends) uses the current handle. For
+	// files opened directly via GenericIO.OpenTable both are identical.
+	handle := g.Handle
+	if handle == nil {
+		handle, _ = file.handle.(io.ReadWriteSeeker)
 	}
-	if handle == nil || reflect.ValueOf(handle).IsNil() {
+	seeker, ok := handle.(io.ReadWriteSeeker)
+	if !ok {
+		return nil, NewErrorf("handle is of wrong type %T expected io.ReadWriteSeeker", handle)
+	}
+	if isNilReadWriteSeeker(seeker) {
 		return nil, WrapError(ErrNoDBF)
 	}
-	return handle, nil
+	return seeker, nil
 }
 
 func (g GenericIO) getRelatedHandle(file *File) (io.ReadWriteSeeker, error) {
-	handle, ok := file.relatedHandle.(io.ReadWriteSeeker)
-	if !ok {
-		return nil, NewErrorf("memo handle is of wrong type %T expected io.ReadWriteSeeker", file.relatedHandle)
+	handle := g.RelatedHandle
+	if handle == nil {
+		handle, _ = file.relatedHandle.(io.ReadWriteSeeker)
 	}
-	if handle == nil || reflect.ValueOf(handle).IsNil() {
+	seeker, ok := handle.(io.ReadWriteSeeker)
+	if !ok {
+		return nil, NewErrorf("memo handle is of wrong type %T expected io.ReadWriteSeeker", handle)
+	}
+	if isNilReadWriteSeeker(seeker) {
 		return nil, WrapError(ErrNoFPT)
 	}
-	return handle, nil
+	return seeker, nil
+}
+
+func isNilReadWriteSeeker(handle io.ReadWriteSeeker) bool {
+	if handle == nil {
+		return true
+	}
+	rv := reflect.ValueOf(handle)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }
 
 // findFile searches for the file case-insensitive in the same directory
