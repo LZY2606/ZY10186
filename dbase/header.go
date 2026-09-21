@@ -1,0 +1,60 @@
+package dbase
+
+import "time"
+
+// Containing DBF header information like dBase FileType, last change and rows count.
+// https://docs.microsoft.com/en-us/previous-versions/visualstudio/foxpro/st4a0s68(v=vs.80)#table-header-record-structure
+type Header struct {
+	FileType   byte     // File type flag
+	Year       uint8    // Last update year (0-99)
+	Month      uint8    // Last update month
+	Day        uint8    // Last update day
+	RowsCount  uint32   // Number of rows in file
+	FirstRow   uint16   // Position of first data row
+	RowLength  uint16   // Length of one data row, including delete flag
+	Reserved   [16]byte // Reserved
+	TableFlags byte     // Table flags
+	CodePage   byte     // Code page mark
+}
+
+// The raw header of the Memo file.
+type MemoHeader struct {
+	NextFree  uint32  // Location of next free block
+	Unused    [2]byte // Unused
+	BlockSize uint16  // Block size (bytes per block)
+}
+
+// Modified parses the year, month and day stored in the header to time.Time.
+// The year is stored in decades (2 digits) and added to the base century.
+// If base is 0, the default base century 2000 is used (years 2000-2099).
+func (h *Header) Modified(base int) time.Time {
+	if base == 0 {
+		base = 2000
+	}
+	return time.Date(base+int(h.Year), time.Month(h.Month), int(h.Day), 0, 0, 0, 0, time.Local)
+}
+
+// ColumnsCount returns the calculated number of columns from the header information alone.
+// This is the fastest way to determine the number of columns without reading the column definitions.
+func (h *Header) ColumnsCount() uint16 {
+	return (h.FirstRow - 296) / 32
+}
+
+// RecordsCount returns the number of records (rows) in the dBase table.
+func (h *Header) RecordsCount() uint32 {
+	return h.RowsCount
+}
+
+// FileSize returns the calculated file size in bytes based on the header information.
+func (h *Header) FileSize() int64 {
+	return 296 + int64(h.ColumnsCount()*32) + int64(h.RowsCount*uint32(h.RowLength))
+}
+
+// ValidateFileSize checks if the calculated file size exceeds the maximum allowed size
+func (h *Header) ValidateFileSize() error {
+	fileSize := h.FileSize()
+	if fileSize > MaxTableFileSize {
+		return NewErrorf("calculated file size exceeds maximum: %d > %d bytes", fileSize, MaxTableFileSize)
+	}
+	return nil
+}
